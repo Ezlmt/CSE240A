@@ -45,16 +45,17 @@ uint32_t *tournament_choice;         // Choice Predictor
 uint32_t tournament_global_history;  // Global History Register
 
 // Custom Predictor Data Structures
-#define CUSTOM_GHIST_BITS 16    // 全局历史位数
+#define CUSTOM_GHIST_BITS 18    // 增加全局历史位数
 #define CUSTOM_PHT_BITS 16      // 模式历史表位数
 #define CUSTOM_BHT_BITS 14      // 分支历史表位数
-#define CUSTOM_LPT_BITS 10      // 循环预测表位数
+#define CUSTOM_LPT_BITS 12      // 增加循环预测表位数
 #define CUSTOM_LPT_TAG_BITS 16  // 循环预测表标签位数
 #define CUSTOM_LPT_CONF_BITS 4  // 循环置信度位数
-#define CUSTOM_LHIST_BITS 12    // 局部历史位数
-#define CUSTOM_PC_BITS 10       // PC索引位数
+#define CUSTOM_LHIST_BITS 14    // 增加局部历史位数
+#define CUSTOM_PC_BITS 12       // 增加PC索引位数
 #define CUSTOM_META_BITS 12     // 元预测器位数
 #define CUSTOM_SIMPLE_BITS 12   // 简单PC预测器位数
+#define CUSTOM_INT_BITS 10      // 整数预测器位数
 
 typedef struct {
     uint32_t tag;           // 循环标签
@@ -63,6 +64,7 @@ typedef struct {
     uint8_t  is_loop;      // 是否为循环分支
     uint32_t last_outcome; // 上次结果
     uint32_t pattern;      // 循环模式
+    uint32_t depth;        // 循环嵌套深度
 } loop_entry_t;
 
 typedef struct {
@@ -71,17 +73,22 @@ typedef struct {
     uint32_t loop_correct;      // 循环预测器正确次数
     uint32_t hybrid_correct;    // 混合预测器正确次数
     uint32_t simple_correct;    // 简单预测器正确次数
+    uint32_t int_correct;       // 整数预测器正确次数
     uint32_t total_count;       // 总预测次数
     uint32_t recent_window;     // 最近窗口计数
+    uint32_t int_branches;      // 整数分支计数
+    uint32_t loop_branches;     // 循环分支计数
 } meta_stats_t;
 
 uint32_t *custom_pht;           // 模式历史表 (全局)
 uint32_t *custom_bht;           // 分支历史表 (混合)
 uint32_t *custom_lht;           // 局部历史表
 uint32_t *custom_simple;        // 简单PC预测器
+uint32_t *custom_int;           // 整数专用预测器
 uint32_t *custom_local_history; // 局部历史寄存器
 uint32_t *custom_meta;          // 元预测器表
 uint32_t custom_history;        // 全局历史寄存器
+uint32_t custom_path_history;   // 路径历史
 loop_entry_t *custom_lpt;       // 循环预测表
 meta_stats_t custom_stats;      // 全局统计信息
 
@@ -114,15 +121,33 @@ uint8_t update_counter(uint8_t counter, uint8_t outcome) {
 
 // 计算哈希索引的辅助函数
 uint32_t compute_hash_1(uint32_t pc, uint32_t history) {
-    return (pc >> 2) ^ history ^ ((pc >> 8) & 0xFF);
+    return ((pc >> 2) ^ history ^ (history >> 4) ^ (pc >> 10)) & MASK(CUSTOM_PHT_BITS);
 }
 
 uint32_t compute_hash_2(uint32_t pc, uint32_t history) {
-    return ((pc >> 2) ^ (history << 1) ^ (history >> 3)) & 0xFFFF;
+    return ((pc >> 3) ^ (history << 2) ^ (history >> 2) ^ custom_path_history) & MASK(CUSTOM_BHT_BITS);
 }
 
 uint32_t compute_hash_3(uint32_t pc, uint32_t history) {
-    return (pc >> 3) ^ (history >> 1) ^ ((pc >> 12) & 0xF);
+    return ((pc >> 4) ^ history ^ (pc >> 8) ^ (history << 3)) & MASK(CUSTOM_LHIST_BITS);
+}
+
+// 检测是否为整数分支
+uint8_t is_int_branch(uint32_t pc) {
+    // 使用PC的特征来判断
+    uint32_t pc_pattern = (pc >> 2) & 0xFF;
+    return (pc_pattern < 0x80); // 简单启发式判断
+}
+
+// 估计循环嵌套深度
+uint32_t estimate_loop_depth(uint32_t pc, uint32_t history) {
+    uint32_t depth = 0;
+    uint32_t pattern = history;
+    while (pattern) {
+        if (pattern & 1) depth++;
+        pattern >>= 1;
+    }
+    return (depth > 3) ? 3 : depth;
 }
 
 //------------------------------------//
@@ -231,10 +256,10 @@ init_predictor()
 uint8_t
 make_prediction(uint32_t pc)
 {
-    // Make a prediction based on the bpType
-    switch (bpType) {
-        case STATIC:
-            return TAKEN;
+  // Make a prediction based on the bpType
+  switch (bpType) {
+    case STATIC:
+      return TAKEN;
             
         case GSHARE: {
             // XOR PC with global history
@@ -279,149 +304,185 @@ make_prediction(uint32_t pc)
             // 简单PC预测器索引
             uint32_t simple_index = (pc >> 3) & MASK(CUSTOM_SIMPLE_BITS);
             
+            // 整数预测器索引
+            uint32_t int_index = ((pc >> 2) ^ (pc >> 8)) & MASK(CUSTOM_INT_BITS);
+            
             // 循环预测器索引
             uint32_t loop_index = ((pc >> 4) ^ (pc >> 8)) & MASK(CUSTOM_LPT_BITS);
             uint32_t loop_tag = (pc >> 2) & MASK(CUSTOM_LPT_TAG_BITS);
             
             // 元预测器索引
-            uint32_t meta_index = ((pc >> 2) ^ custom_history ^ (pc >> 10)) & MASK(CUSTOM_META_BITS);
+            uint32_t meta_index = ((pc >> 2) ^ custom_history ^ custom_path_history) & MASK(CUSTOM_META_BITS);
             
-            // 获取各个预测器的预测结果
+            // 获取预测结果用于统计
             uint8_t global_pred = get_prediction_from_counter(custom_pht[global_index]);
             uint8_t hybrid_pred = get_prediction_from_counter(custom_bht[hybrid_index]);
             uint8_t local_pred = get_prediction_from_counter(custom_lht[local_index]);
             uint8_t simple_pred = get_prediction_from_counter(custom_simple[simple_index]);
+            uint8_t int_pred = get_prediction_from_counter(custom_int[int_index]);
             
-            // 计算预测器置信度
-            uint8_t global_conf = (custom_pht[global_index] == ST || custom_pht[global_index] == SN);
-            uint8_t hybrid_conf = (custom_bht[hybrid_index] == ST || custom_bht[hybrid_index] == SN);
-            uint8_t local_conf = (custom_lht[local_index] == ST || custom_lht[local_index] == SN);
-            uint8_t simple_conf = (custom_simple[simple_index] == ST || custom_simple[simple_index] == SN);
+            // 检查是否为整数分支
+            uint8_t is_int = is_int_branch(pc);
+            if (is_int) {
+                custom_stats.int_branches++;
+            }
             
-            // 循环预测器
+            // 更新统计信息
+            custom_stats.total_count++;
+            custom_stats.recent_window++;
+            
+            if (global_pred == outcome) custom_stats.global_correct++;
+            if (local_pred == outcome) custom_stats.local_correct++;
+            if (hybrid_pred == outcome) custom_stats.hybrid_correct++;
+            if (simple_pred == outcome) custom_stats.simple_correct++;
+            if (int_pred == outcome) custom_stats.int_correct++;
+            
+            // 每10000次预测重置最近窗口统计，保持自适应性
+            if (custom_stats.recent_window >= 10000) {
+                custom_stats.global_correct = (custom_stats.global_correct * 8) / 10;
+                custom_stats.local_correct = (custom_stats.local_correct * 8) / 10;
+                custom_stats.hybrid_correct = (custom_stats.hybrid_correct * 8) / 10;
+                custom_stats.simple_correct = (custom_stats.simple_correct * 8) / 10;
+                custom_stats.int_correct = (custom_stats.int_correct * 8) / 10;
+                custom_stats.loop_correct = (custom_stats.loop_correct * 8) / 10;
+                custom_stats.total_count = (custom_stats.total_count * 8) / 10;
+                custom_stats.int_branches = (custom_stats.int_branches * 8) / 10;
+                custom_stats.loop_branches = (custom_stats.loop_branches * 8) / 10;
+                custom_stats.recent_window = 0;
+            }
+            
+            // 更新循环预测器
             loop_entry_t *loop_entry = &custom_lpt[loop_index];
-            uint8_t loop_pred = NOTTAKEN;
-            uint8_t loop_confident = 0;
-            
-            if (loop_entry->tag == loop_tag && loop_entry->is_loop) {
-                if (loop_entry->confidence >= ((1 << CUSTOM_LPT_CONF_BITS) - 2)) {
-                    // 高置信度循环预测
-                    if (loop_entry->pattern & 1) {
-                        loop_pred = TAKEN;
-                    } else {
-                        loop_pred = (loop_entry->iter_count % 8 == 0) ? NOTTAKEN : TAKEN;
+            if (loop_entry->tag == loop_tag) {
+                // 已知分支
+                if (outcome == TAKEN) {
+                    loop_entry->iter_count++;
+                    custom_stats.loop_branches++;
+                    
+                    // 更新循环模式
+                    loop_entry->pattern = ((loop_entry->pattern << 1) | 1) & 0xFFFF;
+                    
+                    if (loop_entry->iter_count >= 3) {
+                        loop_entry->is_loop = 1;
+                        if (loop_entry->confidence < ((1 << CUSTOM_LPT_CONF_BITS) - 1)) {
+                            loop_entry->confidence++;
+                        }
                     }
-                    loop_confident = 1;
-                } else if (loop_entry->confidence >= (1 << (CUSTOM_LPT_CONF_BITS - 2))) {
-                    loop_pred = TAKEN;
-                    loop_confident = 1;
+                    
+                    // 更新循环嵌套深度
+                    uint32_t depth = estimate_loop_depth(pc, custom_history);
+                    loop_entry->depth = depth;
+                } else {
+                    // 分支未taken，可能是循环结束
+                    if (loop_entry->is_loop && loop_entry->iter_count > 0) {
+                        // 预测循环结束
+                        uint8_t loop_pred;
+                        if (loop_entry->pattern & 1) {
+                            loop_pred = TAKEN;
+                        } else {
+                            loop_pred = ((loop_entry->iter_count + loop_entry->depth) % (8 >> loop_entry->depth) == 0) ? NOTTAKEN : TAKEN;
+                        }
+                        
+                        if (loop_pred == outcome) {
+                            custom_stats.loop_correct++;
+                            if (loop_entry->confidence < ((1 << CUSTOM_LPT_CONF_BITS) - 1)) {
+                                loop_entry->confidence++;
+                            }
+                        } else {
+                            if (loop_entry->confidence > 0) {
+                                loop_entry->confidence--;
+                            }
+                        }
+                    }
+                    
+                    // 更新模式
+                    loop_entry->pattern = (loop_entry->pattern << 1) & 0xFFFF;
+                    loop_entry->iter_count = 0;
+                    
+                    if (loop_entry->confidence <= 1) {
+                        loop_entry->is_loop = 0;
+                    }
+                }
+                loop_entry->last_outcome = outcome;
+            } else {
+                // 新分支
+                loop_entry->tag = loop_tag;
+                loop_entry->confidence = 0;
+                loop_entry->iter_count = (outcome == TAKEN) ? 1 : 0;
+                loop_entry->is_loop = 0;
+                loop_entry->last_outcome = outcome;
+                loop_entry->pattern = outcome ? 1 : 0;
+                loop_entry->depth = estimate_loop_depth(pc, custom_history);
+            }
+            
+            // 更新元预测器
+            uint8_t best_predictor = 0;  // 0: local, 1: global, 2: hybrid, 3: simple
+            uint8_t correct_count = 0;
+            
+            if (global_pred == outcome) correct_count++;
+            if (local_pred == outcome) correct_count++;
+            if (hybrid_pred == outcome) correct_count++;
+            if (simple_pred == outcome) correct_count++;
+            if (int_pred == outcome) correct_count++;
+            
+            // 选择最佳预测器
+            if (correct_count == 1) {
+                // 只有一个预测器正确
+                if (global_pred == outcome) best_predictor = 1;
+                else if (local_pred == outcome) best_predictor = 0;
+                else if (hybrid_pred == outcome) best_predictor = 2;
+                else if (simple_pred == outcome) best_predictor = 3;
+            } else if (correct_count > 1) {
+                // 多个预测器正确，根据当前权重选择
+                uint32_t total = custom_stats.total_count;
+                if (total > 0) {
+                    uint32_t global_weight = (custom_stats.global_correct * 100) / total;
+                    uint32_t local_weight = (custom_stats.local_correct * 100) / total;
+                    uint32_t hybrid_weight = (custom_stats.hybrid_correct * 100) / total;
+                    uint32_t simple_weight = (custom_stats.simple_correct * 100) / total;
+                    uint32_t int_weight = (custom_stats.int_correct * 100) / total;
+                    
+                    if (is_int && int_weight >= 45) {
+                        best_predictor = 0;  // 整数分支偏向局部预测
+                    } else if (global_weight >= local_weight && global_weight >= hybrid_weight && global_weight >= simple_weight) {
+                        best_predictor = 1;
+                    } else if (hybrid_weight >= local_weight && hybrid_weight >= simple_weight) {
+                        best_predictor = 2;
+                    } else if (simple_weight >= local_weight) {
+                        best_predictor = 3;
+                    } else {
+                        best_predictor = 0;
+                    }
                 }
             }
             
-            // 动态权重计算
-            uint32_t total = custom_stats.total_count;
-            if (total == 0) total = 1; // 避免除零
-            
-            uint32_t global_weight = (custom_stats.global_correct * 100) / total;
-            uint32_t local_weight = (custom_stats.local_correct * 100) / total;
-            uint32_t hybrid_weight = (custom_stats.hybrid_correct * 100) / total;
-            uint32_t simple_weight = (custom_stats.simple_correct * 100) / total;
-            uint32_t loop_weight = (custom_stats.loop_correct * 100) / total;
-            
-            // 如果循环预测器有很高置信度且权重不错，优先使用
-            if (loop_confident && loop_entry->confidence >= ((1 << CUSTOM_LPT_CONF_BITS) - 1) && 
-                loop_weight >= 40) {
-                return loop_pred;
+            // 温和更新元预测器
+            if (best_predictor == 1 && custom_meta[meta_index] < 3) {
+                custom_meta[meta_index]++;
+            } else if (best_predictor == 0 && custom_meta[meta_index] > 0) {
+                custom_meta[meta_index]--;
             }
             
-            // 使用元预测器进行智能选择
-            uint8_t meta_choice = custom_meta[meta_index];
+            // 更新各个预测器
+            custom_pht[global_index] = update_counter(custom_pht[global_index], outcome);
+            custom_bht[hybrid_index] = update_counter(custom_bht[hybrid_index], outcome);
+            custom_lht[local_index] = update_counter(custom_lht[local_index], outcome);
+            custom_simple[simple_index] = update_counter(custom_simple[simple_index], outcome);
+            custom_int[int_index] = update_counter(custom_int[int_index], outcome);
             
-            // 更智能的预测器选择策略
-            if (total > 500) {
-                // 找到最佳预测器
-                uint32_t best_weight = global_weight;
-                uint8_t best_pred = global_pred;
-                uint8_t best_conf = global_conf;
-                
-                if (local_weight > best_weight) {
-                    best_weight = local_weight;
-                    best_pred = local_pred;
-                    best_conf = local_conf;
-                }
-                if (hybrid_weight > best_weight) {
-                    best_weight = hybrid_weight;
-                    best_pred = hybrid_pred;
-                    best_conf = hybrid_conf;
-                }
-                if (simple_weight > best_weight) {
-                    best_weight = simple_weight;
-                    best_pred = simple_pred;
-                    best_conf = simple_conf;
-                }
-                
-                // 如果最佳预测器有高置信度且性能明显更好，使用它
-                if (best_conf && best_weight > 60) {
-                    return best_pred;
-                }
-                
-                // 否则根据元预测器选择
-                if (meta_choice == 0 && local_weight >= 45) {
-                    return local_pred;
-                } else if (meta_choice == 1 && global_weight >= 45) {
-                    return global_pred;
-                } else if (meta_choice == 2 && hybrid_weight >= 45) {
-                    return hybrid_pred;
-                } else if (meta_choice == 3 && simple_weight >= 45) {
-                    return simple_pred;
-                }
-            }
-            
-            // 改进的投票机制
-            int taken_votes = 0;
-            int total_votes = 0;
-            
-            // 基础投票
-            if (global_pred == TAKEN) taken_votes++;
-            total_votes++;
-            
-            if (hybrid_pred == TAKEN) taken_votes++;
-            total_votes++;
-            
-            if (local_pred == TAKEN) taken_votes++;
-            total_votes++;
-            
-            if (simple_pred == TAKEN) taken_votes++;
-            total_votes++;
-            
-            // 循环预测器有额外权重
-            if (loop_confident) {
-                if (loop_pred == TAKEN) taken_votes += 2;
-                total_votes += 2;
-            }
-            
-            // 高置信度预测器有额外权重
-            if (global_conf && global_pred == TAKEN) taken_votes++;
-            if (global_conf) total_votes++;
-            
-            if (hybrid_conf && hybrid_pred == TAKEN) taken_votes++;
-            if (hybrid_conf) total_votes++;
-            
-            if (local_conf && local_pred == TAKEN) taken_votes++;
-            if (local_conf) total_votes++;
-            
-            if (simple_conf && simple_pred == TAKEN) taken_votes++;
-            if (simple_conf) total_votes++;
-            
-            return (taken_votes * 2 >= total_votes) ? TAKEN : NOTTAKEN;
+            // 更新历史寄存器
+            custom_local_history[pc_index] = ((local_history << 1) | outcome) & MASK(CUSTOM_LHIST_BITS);
+            custom_history = ((custom_history << 1) | outcome) & MASK(CUSTOM_GHIST_BITS);
+            custom_path_history = ((custom_path_history << 1) | (pc & 1)) & MASK(CUSTOM_GHIST_BITS);
+            break;
         }
             
-        default:
-            break;
-    }
+    default:
+      break;
+  }
 
     // If there is not a compatible bpType then return NOTTAKEN
-    return NOTTAKEN;
+  return NOTTAKEN;
 }
 
 // Train the predictor
@@ -498,18 +559,28 @@ train_predictor(uint32_t pc, uint8_t outcome)
             // 简单PC预测器索引
             uint32_t simple_index = (pc >> 3) & MASK(CUSTOM_SIMPLE_BITS);
             
+            // 整数预测器索引
+            uint32_t int_index = ((pc >> 2) ^ (pc >> 8)) & MASK(CUSTOM_INT_BITS);
+            
             // 循环预测器索引
             uint32_t loop_index = ((pc >> 4) ^ (pc >> 8)) & MASK(CUSTOM_LPT_BITS);
             uint32_t loop_tag = (pc >> 2) & MASK(CUSTOM_LPT_TAG_BITS);
             
             // 元预测器索引
-            uint32_t meta_index = ((pc >> 2) ^ custom_history ^ (pc >> 10)) & MASK(CUSTOM_META_BITS);
+            uint32_t meta_index = ((pc >> 2) ^ custom_history ^ custom_path_history) & MASK(CUSTOM_META_BITS);
             
             // 获取预测结果用于统计
             uint8_t global_pred = get_prediction_from_counter(custom_pht[global_index]);
             uint8_t hybrid_pred = get_prediction_from_counter(custom_bht[hybrid_index]);
             uint8_t local_pred = get_prediction_from_counter(custom_lht[local_index]);
             uint8_t simple_pred = get_prediction_from_counter(custom_simple[simple_index]);
+            uint8_t int_pred = get_prediction_from_counter(custom_int[int_index]);
+            
+            // 检查是否为整数分支
+            uint8_t is_int = is_int_branch(pc);
+            if (is_int) {
+                custom_stats.int_branches++;
+            }
             
             // 更新统计信息
             custom_stats.total_count++;
@@ -519,6 +590,7 @@ train_predictor(uint32_t pc, uint8_t outcome)
             if (local_pred == outcome) custom_stats.local_correct++;
             if (hybrid_pred == outcome) custom_stats.hybrid_correct++;
             if (simple_pred == outcome) custom_stats.simple_correct++;
+            if (int_pred == outcome) custom_stats.int_correct++;
             
             // 每10000次预测重置最近窗口统计，保持自适应性
             if (custom_stats.recent_window >= 10000) {
@@ -526,8 +598,11 @@ train_predictor(uint32_t pc, uint8_t outcome)
                 custom_stats.local_correct = (custom_stats.local_correct * 8) / 10;
                 custom_stats.hybrid_correct = (custom_stats.hybrid_correct * 8) / 10;
                 custom_stats.simple_correct = (custom_stats.simple_correct * 8) / 10;
+                custom_stats.int_correct = (custom_stats.int_correct * 8) / 10;
                 custom_stats.loop_correct = (custom_stats.loop_correct * 8) / 10;
                 custom_stats.total_count = (custom_stats.total_count * 8) / 10;
+                custom_stats.int_branches = (custom_stats.int_branches * 8) / 10;
+                custom_stats.loop_branches = (custom_stats.loop_branches * 8) / 10;
                 custom_stats.recent_window = 0;
             }
             
@@ -537,6 +612,8 @@ train_predictor(uint32_t pc, uint8_t outcome)
                 // 已知分支
                 if (outcome == TAKEN) {
                     loop_entry->iter_count++;
+                    custom_stats.loop_branches++;
+                    
                     // 更新循环模式
                     loop_entry->pattern = ((loop_entry->pattern << 1) | 1) & 0xFFFF;
                     
@@ -546,6 +623,10 @@ train_predictor(uint32_t pc, uint8_t outcome)
                             loop_entry->confidence++;
                         }
                     }
+                    
+                    // 更新循环嵌套深度
+                    uint32_t depth = estimate_loop_depth(pc, custom_history);
+                    loop_entry->depth = depth;
                 } else {
                     // 分支未taken，可能是循环结束
                     if (loop_entry->is_loop && loop_entry->iter_count > 0) {
@@ -554,11 +635,18 @@ train_predictor(uint32_t pc, uint8_t outcome)
                         if (loop_entry->pattern & 1) {
                             loop_pred = TAKEN;
                         } else {
-                            loop_pred = (loop_entry->iter_count % 8 == 0) ? NOTTAKEN : TAKEN;
+                            loop_pred = ((loop_entry->iter_count + loop_entry->depth) % (8 >> loop_entry->depth) == 0) ? NOTTAKEN : TAKEN;
                         }
                         
                         if (loop_pred == outcome) {
                             custom_stats.loop_correct++;
+                            if (loop_entry->confidence < ((1 << CUSTOM_LPT_CONF_BITS) - 1)) {
+                                loop_entry->confidence++;
+                            }
+                        } else {
+                            if (loop_entry->confidence > 0) {
+                                loop_entry->confidence--;
+                            }
                         }
                     }
                     
@@ -566,9 +654,6 @@ train_predictor(uint32_t pc, uint8_t outcome)
                     loop_entry->pattern = (loop_entry->pattern << 1) & 0xFFFF;
                     loop_entry->iter_count = 0;
                     
-                    if (loop_entry->confidence > 0) {
-                        loop_entry->confidence--;
-                    }
                     if (loop_entry->confidence <= 1) {
                         loop_entry->is_loop = 0;
                     }
@@ -582,6 +667,7 @@ train_predictor(uint32_t pc, uint8_t outcome)
                 loop_entry->is_loop = 0;
                 loop_entry->last_outcome = outcome;
                 loop_entry->pattern = outcome ? 1 : 0;
+                loop_entry->depth = estimate_loop_depth(pc, custom_history);
             }
             
             // 更新元预测器
@@ -592,6 +678,7 @@ train_predictor(uint32_t pc, uint8_t outcome)
             if (local_pred == outcome) correct_count++;
             if (hybrid_pred == outcome) correct_count++;
             if (simple_pred == outcome) correct_count++;
+            if (int_pred == outcome) correct_count++;
             
             // 选择最佳预测器
             if (correct_count == 1) {
@@ -608,8 +695,11 @@ train_predictor(uint32_t pc, uint8_t outcome)
                     uint32_t local_weight = (custom_stats.local_correct * 100) / total;
                     uint32_t hybrid_weight = (custom_stats.hybrid_correct * 100) / total;
                     uint32_t simple_weight = (custom_stats.simple_correct * 100) / total;
+                    uint32_t int_weight = (custom_stats.int_correct * 100) / total;
                     
-                    if (global_weight >= local_weight && global_weight >= hybrid_weight && global_weight >= simple_weight) {
+                    if (is_int && int_weight >= 45) {
+                        best_predictor = 0;  // 整数分支偏向局部预测
+                    } else if (global_weight >= local_weight && global_weight >= hybrid_weight && global_weight >= simple_weight) {
                         best_predictor = 1;
                     } else if (hybrid_weight >= local_weight && hybrid_weight >= simple_weight) {
                         best_predictor = 2;
@@ -627,17 +717,18 @@ train_predictor(uint32_t pc, uint8_t outcome)
             } else if (best_predictor == 0 && custom_meta[meta_index] > 0) {
                 custom_meta[meta_index]--;
             }
-            // 对于hybrid(2)和simple(3)，使用中间值策略
             
             // 更新各个预测器
             custom_pht[global_index] = update_counter(custom_pht[global_index], outcome);
             custom_bht[hybrid_index] = update_counter(custom_bht[hybrid_index], outcome);
             custom_lht[local_index] = update_counter(custom_lht[local_index], outcome);
             custom_simple[simple_index] = update_counter(custom_simple[simple_index], outcome);
+            custom_int[int_index] = update_counter(custom_int[int_index], outcome);
             
             // 更新历史寄存器
             custom_local_history[pc_index] = ((local_history << 1) | outcome) & MASK(CUSTOM_LHIST_BITS);
             custom_history = ((custom_history << 1) | outcome) & MASK(CUSTOM_GHIST_BITS);
+            custom_path_history = ((custom_path_history << 1) | (pc & 1)) & MASK(CUSTOM_GHIST_BITS);
             break;
         }
             
